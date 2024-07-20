@@ -1,20 +1,26 @@
-import { ZegoUIKitPrebuilt } from "@zegocloud/zego-uikit-prebuilt";
+import React, { useEffect, useState, useRef } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { getDocs, query, where } from "firebase/firestore";
 import moment from "moment";
-import React, { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import useToast from "../hooks/useToast";
 import { firebaseAuth, meetingsRef } from '../utils/FirebaseConfig';
 import { generateMeetingID } from "../utils/generateMeetingId";
+import io from 'socket.io-client';
 
- function JoinMeeting() {
+const socket = io('http://localhost:3000'); // Change this to your server address if needed
+
+function JoinMeeting() {
   const params = useParams();
   const navigate = useNavigate();
   const [createToast] = useToast();
   const [isAllowed, setIsAllowed] = useState(false);
   const [user, setUser] = useState<any>(undefined);
   const [userLoaded, setUserLoaded] = useState(false);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const [peerConnection, setPeerConnection] = useState<RTCPeerConnection | null>(null);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
   onAuthStateChanged(firebaseAuth, (currentUser) => {
     if (currentUser) {
@@ -22,6 +28,7 @@ import { generateMeetingID } from "../utils/generateMeetingId";
     }
     setUserLoaded(true);
   });
+
   useEffect(() => {
     const getMeetingData = async () => {
       if (params.id && userLoaded) {
@@ -83,51 +90,72 @@ import { generateMeetingID } from "../utils/generateMeetingId";
       }
     };
     getMeetingData();
-}, [ params.id,user,userLoaded, createToast,navigate]);
+  }, [params.id, user, userLoaded, createToast, navigate]);
 
-const myMeeting = async (element: any) => {
-  const kitToken = ZegoUIKitPrebuilt.generateKitTokenForTest(
-    parseInt(process.env.REACT_APP_ZEGOCLOUD_APP_ID!),
-    process.env.REACT_APP_ZEGOCLOUD_SERVER_SECRET as string,
-    params.id as string,
-    user?.uid ? user.uid : generateMeetingID(),
-    user?.displayName ? user.displayName : generateMeetingID()
-  );
-  const zp = ZegoUIKitPrebuilt.create(kitToken);
+  useEffect(() => {
+    if (isAllowed) {
+      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(stream => {
+          setLocalStream(stream);
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+          }
 
+          const peerConnection = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+          });
 
-    zp?.joinRoom({
-      container: element,
-      maxUsers: 50,
-      sharedLinks: [
-        {
-          name: "Personal link",
-          url: window.location.origin,
-        },
-      ],
-      scenario: {
-        mode: ZegoUIKitPrebuilt.VideoConference,
-      },
-    });
+          stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+
+          peerConnection.onicecandidate = event => {
+            if (event.candidate) {
+              socket.emit('candidate', event.candidate);
+            }
+          };
+
+          peerConnection.ontrack = event => {
+            if (remoteVideoRef.current && event.streams[0]) {
+              remoteVideoRef.current.srcObject = event.streams[0];
+            }
+          };
+
+          setPeerConnection(peerConnection);
+
+          socket.on('offer', async (offer) => {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            socket.emit('answer', answer);
+          });
+
+          socket.on('answer', async (answer) => {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+          });
+
+          socket.on('candidate', async (candidate) => {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+          });
+
+          socket.emit('join', params.id);
+        });
+    }
+  }, [isAllowed]);
+
+  const createOffer = async () => {
+    if (peerConnection) {
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.emit('offer', offer);
+    }
   };
 
   return isAllowed ? (
-    <div
-      style={{
-        display: "flex",
-        height: "100vh",
-        flexDirection: "column",
-      }}
-    >
-      <div
-        className="myCallContainer"
-        ref={myMeeting}
-        style={{ width: "100%", height: "100vh" }}
-      ></div>
+    <div style={{ display: "flex", height: "100vh", flexDirection: "column" }}>
+      <video ref={localVideoRef} autoPlay muted style={{ width: "50%" }} />
+      <video ref={remoteVideoRef} autoPlay style={{ width: "50%" }} />
+      <button onClick={createOffer}>Start Call</button>
     </div>
-  ) : (
-    <></>
-  );
+  ) : <></>;
 }
-export default JoinMeeting;
 
+export default JoinMeeting;
